@@ -1,0 +1,98 @@
+name: Build Windows x64 EXEs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag (v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+      - name: Validate release tag
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if ($env:RELEASE_TAG -cne 'v1.0.0') { throw 'Only v1.0.0 is supported by this build' }
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-test.txt
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build CLI
+        run: cmd /c 04-Build\build_cli.bat
+      - name: Build GUI
+        run: cmd /c 04-Build\build_gui.bat
+      - name: Smoke test executables
+        shell: pwsh
+        run: |
+          foreach ($file in @('01-CLI/VM-SSH-CLI.exe', '02-GUI/VM-SSH-GUI.exe')) {
+            if (!(Test-Path $file) -or (Get-Item $file).Length -eq 0) { throw "Missing or empty: $file" }
+          }
+          $version = & .\01-CLI\VM-SSH-CLI.exe --version
+          Write-Host "CLI version: $version"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '1\.0\.0') { throw 'CLI smoke test failed' }
+          $gui = Start-Process -FilePath .\02-GUI\VM-SSH-GUI.exe -PassThru
+          try {
+            Start-Sleep -Seconds 10
+            $gui.Refresh()
+            if ($gui.HasExited) { throw "GUI exited during startup: $($gui.ExitCode)" }
+            Write-Host 'GUI remained running for 10 seconds'
+          } finally {
+            if (!$gui.HasExited) {
+              $null = $gui.CloseMainWindow()
+              if (!$gui.WaitForExit(5000)) { Stop-Process -Id $gui.Id -Force }
+            }
+          }
+      - name: Record Windows build verification
+        shell: pwsh
+        run: |
+          $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss UTC')
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $python = python --version
+          $details = "构建时间：$stamp`n`nActions：$run`n`n提交：$env:GITHUB_SHA`n`nRunner：$env:RUNNER_OS x64；$python"
+          Set-Content 01-CLI/WINDOWS_EXE_STATUS.md -Encoding utf8 "# Windows CLI EXE 状态`n`n已构建并通过 --version 启动检查。`n`n$details"
+          Set-Content 02-GUI/WINDOWS_EXE_STATUS.md -Encoding utf8 "# Windows GUI EXE 状态`n`n已构建并通过 10 秒启动检查。`n`n$details"
+          $hashes = Get-FileHash 01-CLI/VM-SSH-CLI.exe,02-GUI/VM-SSH-GUI.exe -Algorithm SHA256 | ForEach-Object { "- $($_.Path | Split-Path -Leaf): $($_.Hash)" }
+          Set-Content BUILD_STATUS.md -Encoding utf8 "# VM SSH Manager v1.0.0 构建与验收状态`n`nWindows 测试通过；CLI --version 和 GUI 10 秒启动检查通过。`n`n真实 Ubuntu/Kali VM 端到端测试：未执行，不能以启动检查替代。`n`n$details`n`n## EXE SHA256`n`n$($hashes -join "`n")"
+          Get-FileHash 01-CLI/VM-SSH-CLI.exe,02-GUI/VM-SSH-GUI.exe -Algorithm SHA256 | Format-List
+          Get-Item 01-CLI/VM-SSH-CLI.exe,02-GUI/VM-SSH-GUI.exe | Select-Object Name,Length | Format-Table
+      - name: Package source and complete bundle
+        run: python 04-Build/package_release.py
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: VM-SSH-Manager-v1.0.0-Windows-x64
+          path: |
+            VM-SSH-Manager-v1.0.0-Complete.zip
+            BUILD_STATUS.md
+            01-CLI/VM-SSH-CLI.exe
+            02-GUI/VM-SSH-GUI.exe
+            01-CLI/VM-SSH-CLI-Source.zip
+            02-GUI/VM-SSH-GUI-Source.zip
+          if-no-files-found: error
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          $assets = @('01-CLI/VM-SSH-CLI.exe', '02-GUI/VM-SSH-GUI.exe', '01-CLI/VM-SSH-CLI-Source.zip', '02-GUI/VM-SSH-GUI-Source.zip', 'VM-SSH-Manager-v1.0.0-Complete.zip', 'BUILD_STATUS.md')
+          foreach ($file in $assets) { if (!(Test-Path $file) -or (Get-Item $file).Length -eq 0) { throw "Missing or empty: $file" } }
+          gh release create $env:RELEASE_TAG @assets --target $env:GITHUB_SHA --title 'VM SSH Manager v1.0.0' --notes 'Windows x64 构建和启动检查已通过。真实 Ubuntu/Kali VM 端到端测试尚未执行。'
+          if ($LASTEXITCODE -ne 0) { throw 'Release creation failed' }
